@@ -1,0 +1,1 @@
+{"audience":"Java 开发者 / 编程学习者","reader_task":"理解 ConcurrentHashMap 在 JDK 1.7 与 1.8 间的并发设计演进，掌握分段锁与 CAS+synchronized 两种方案的核心机制与差异","genre_contract":"router.knowledge","adapter":null,"presentation_mode":"normal","visual_plan":{"reason":"使用表格对比两个版本的核心差异，代码块展示关键实现，callout 强调心智模型","blocks":[]}}

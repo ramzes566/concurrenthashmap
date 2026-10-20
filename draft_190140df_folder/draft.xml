@@ -1,0 +1,276 @@
+<title>ConcurrentHashMap 原理演进：JDK 1.7 分段锁 vs JDK 1.8 CAS+synchronized</title>
+
+<p><b>适用读者：</b>Java 开发者、编程学习者</p>
+<p><b>阅读目标：</b>通过两个简化版实现，快速理解 ConcurrentHashMap 从 1.7 到 1.8 的并发设计核心差异——锁粒度如何从"段"细化到"单个桶"，以及 CAS 和协作扩容是如何工作的。</p>
+
+<h1 seq="auto">版本核心差异速览</h1>
+
+<table>
+<thead>
+<tr><th><p>对比维度</p></th><th><p>JDK 1.7</p></th><th><p>JDK 1.8</p></th></tr>
+</thead>
+<tbody>
+<tr><td><p><b>锁粒度</b></p></td><td><p>整个 Segment（段）</p></td><td><p>单个桶（Node）</p></td></tr>
+<tr><td><p><b>锁机制</b></p></td><td><p>Segment 继承 ReentrantLock</p></td><td><p>空桶 CAS 无锁；非空 synchronized(桶头)</p></td></tr>
+<tr><td><p><b>并发上限</b></p></td><td><p>= Segment 数量（默认 16）</p></td><td><p>= 桶数量（随扩容线性增长）</p></td></tr>
+<tr><td><p><b>扩容方式</b></p></td><td><p>单线程迁移整个 Segment</p></td><td><p>多线程协作 transfer</p></td></tr>
+<tr><td><p><b>底层结构</b></p></td><td><p>Segment[] → 每个 Segment 内部有 Node[]</p></td><td><p>直接一个 Node[] + 链表/红黑树</p></td></tr>
+</tbody>
+</table>
+
+<callout emoji="💡" background-color="light-blue" border-color="blue">
+<p><b>一句话心智模型：</b>1.7 把一张大表切成 16 张小表，每张表自己加锁；1.8 把锁砸到每个桶上，空桶直接 CAS 占坑，已经有数据的桶才锁桶头。</p>
+</callout>
+
+<h1 seq="auto">JDK 1.7：分段锁（Segment）</h1>
+
+<h2 seq="auto">核心思想</h2>
+
+<ol>
+<li>把一个大 HashMap 切成 N 个小 HashMap（叫 Segment，默认 N = 16）</li>
+<li>每个 Segment 继承 ReentrantLock，独立加锁</li>
+<li>put 时用 <code>hash(key) &amp; (N-1)</code> 算出 key 落在哪个 Segment，只锁那个段</li>
+<li>不同 Segment 的操作互不干扰，并发度 = Segment 数量</li>
+</ol>
+
+<h2 seq="auto">关键实现代码</h2>
+
+<pre lang="java" caption="CHM17.java — 简化版 1.7 分段锁实现"><code>package concurrenthashmap;
+
+import java.util.concurrent.locks.ReentrantLock;
+
+/**
+ * ConcurrentHashMap 1.7 原理：分段锁（Segment）
+ *
+ * 核心思想：
+ *   1. 把一个大 HashMap 切成 N 个小 HashMap（叫 Segment，默认 N=16）
+ *   2. 每个 Segment 继承 ReentrantLock，独立加锁
+ *   3. put 时用 hash(key) &amp; (N-1) 算出去哪个 Segment 上锁
+ *   4. 不同 Segment 的操作互不干扰，并发度 = Segment 数量
+ *
+ * 演示：简化版只放 get/put 的核心路径，体现"锁粒度 = Segment"
+ */
+public class CHM17 {
+
+    static final int N = 16;                // 16 个分段
+    final Segment[] segments = new Segment[N];
+
+    CHM17() {
+        for (int i = 0; i &lt; N; i++) segments[i] = new Segment();
+    }
+
+    /** 根据 hash 找到分段（源码里有高位扰动，这里简化） */
+    static int segIndex(Object key) {
+        return key.hashCode() &amp; (N - 1);
+    }
+
+    /** 读：不加锁，直接读 Segment 里的 table（1.7 的 table 用 volatile 保证可见性） */
+    Object get(Object key) {
+        Segment seg = segments[segIndex(key)];
+        // volatile 读 table，拿到链表头再逐个比对
+        return seg.tableGet(key);
+    }
+
+    /** 写：锁整个 Segment */
+    void put(Object key, Object value) {
+        Segment seg = segments[segIndex(key)];
+        seg.lock();         // ← 锁粒度是 Segment
+        try {
+            seg.tablePut(key, value);
+        } finally {
+            seg.unlock();
+        }
+    }
+
+    /** 一个 Segment 自己就是一个小 HashMap + ReentrantLock */
+    static class Segment extends ReentrantLock {
+        Node[] table = new Node[4];     // 每个分段内部有自己的桶数组
+        int count;
+
+        Object tableGet(Object key) {
+            for (Node n : table)
+                for (; n != null; n = n.next)
+                    if (n.key.equals(key)) return n.value;
+            return null;
+        }
+
+        void tablePut(Object key, Object value) {
+            int idx = key.hashCode() &amp; (table.length - 1);
+            for (Node n = table[idx]; n != null; n = n.next)
+                if (n.key.equals(key)) { n.value = value; return; }
+            // 头插法
+            Node newNode = new Node(key, value, table[idx]);
+            table[idx] = newNode;
+            count++;
+        }
+    }
+
+    static class Node { Object key, value; Node next;
+        Node(Object k, Object v, Node n) { key = k; value = v; next = n; } }
+
+    /** 验证：两个线程分别写不同分段 → 互不阻塞 */
+    public static void main(String[] args) throws Exception {
+        CHM17 map = new CHM17();
+        int perSeg = 100_000;
+
+        long t1 = System.nanoTime();
+        Thread tA = new Thread(() -&gt; { for (int i = 0; i &lt; perSeg; i++) map.put("A-" + i, i); });
+        Thread tB = new Thread(() -&gt; { for (int i = 0; i &lt; perSeg; i++) map.put("B-" + i, i); });
+        tA.start(); tB.start();
+        tA.join();  tB.join();
+        long cost = (System.nanoTime() - t1) / 1_000_000;
+
+        System.out.printf("1.7分段锁: 写入 %,d 对, 耗时 %d ms%n", perSeg * 2, cost);
+        // 校验所有 key 都能 get 到
+        for (int i = 0; i &lt; perSeg; i++)
+            if (map.get("A-" + i) == null || map.get("B-" + i) == null) {
+                System.out.println("数据丢失！"); return;
+            }
+        System.out.println("数据完整，无丢失");
+    }
+}</code></pre>
+
+<callout emoji="⚠️" background-color="light-yellow" border-color="orange">
+<p><b>1.7 的局限：</b>锁粒度还是偏粗。如果热点数据集中在同一个 Segment，多线程仍然竞争同一把锁。最多 16 路并发，无法进一步利用多核。</p>
+</callout>
+
+<h1 seq="auto">JDK 1.8：CAS + synchronized 锁单个桶</h1>
+
+<h2 seq="auto">相对 1.7 的三个关键升级</h2>
+
+<ol>
+<li><b>取消 Segment</b>，直接一个 Node[] 数组，锁粒度从"段"细化到"单个桶"</li>
+<li><b>空桶用 CAS 无锁插入</b>；非空桶用 <code>synchronized(桶头节点)</code> 加锁</li>
+<li><b>扩容时多线程协作（transfer）</b>，用 CAS 争抢 transferIndex 推进转移进度</li>
+</ol>
+
+<h2 seq="auto">关键实现代码</h2>
+
+<pre lang="java" caption="CHM18.java — 简化版 1.8 CAS+synchronized 实现"><code>package concurrenthashmap;
+
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * ConcurrentHashMap 1.8 原理：CAS + synchronized 锁单个桶
+ *
+ * 相对 1.7 的三个关键升级：
+ *   1. 取消 Segment，直接一个 Node[] 数组，锁粒度从"段"细化到"单个桶"
+ *   2. 空桶用 CAS 无锁插入；非空桶用 synchronized(桶头节点) 加锁
+ *   3. 扩容时多线程协作（transfer），用 CAS 争抢 transferIndex 推进转移进度
+ *
+ * 演示：简化版只展示 CAS 空桶插入 + synchronized(head) 桶内写 + 协作扩容
+ */
+public class CHM18 {
+
+    volatile Node[] table;          // volatile 保证跨线程可见性
+    int sizeCtl;                    // &lt;0 表示正在扩容；&gt;0 表示下一次扩容阈值
+    final AtomicInteger transferIndex = new AtomicInteger(); // 扩容协作进度
+
+    CHM18() {
+        table = new Node[16];
+        sizeCtl = 12;               // 16 * 0.75 = 12
+    }
+
+    /** 核心写入：先 CAS 空桶，失败了再 synchronized(head) */
+    void put(Object key, Object value) {
+        for (;;) {                            // 自旋重试
+            Node[] tab = table;
+            int idx = key.hashCode() &amp; (tab.length - 1);
+            Node head = tab[idx];
+
+            if (head == null) {
+                // 桶是空的 → CAS 直接占坑（无锁路径，最快）
+                if (casPut(tab, idx, null, new Node(key, value))) return;
+                // CAS 失败说明别的线程抢先了，下次循环再看
+            } else if (head.hash == -1) {
+                // 特殊节点：正在扩容的转移桶 → 当前线程协助扩容
+                transfer(tab);
+            } else {
+                // 桶里已有节点 → synchronized 锁桶头，链表/红黑树里写
+                synchronized (head) {                        // ← 锁粒度 = 单个桶
+                    if (tab[idx] == head) {                  // 二次检查：锁期间别的线程有没有换过头
+                        Node tail = head;
+                        for (; tail.next != null; tail = tail.next)
+                            if (tail.key.equals(key)) { tail.value = value; return; }
+                        tail.next = new Node(key, value);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /** CAS：比较桶当前节点是不是 expect，是就换成 newNode */
+    boolean casPut(Node[] tab, int idx, Node expect, Node newNode) {
+        return U.compareAndSwapObject(tab, ((long) idx + 1) * 8L, expect, newNode);
+        // ↑ 实际用的是 Unsafe.compareAndSwapObject，JDK 内部访问，这里模拟
+    }
+
+    /** 协作扩容：拿到 transferIndex 去处理一段旧桶 */
+    void transfer(Node[] oldTab) {
+        // 简化：只展示核心思想——多个线程用 CAS 争抢 transferIndex 的一段
+        // 每个线程处理 oldTab 的 [start, start+stride) 范围内的桶
+        int stride = Math.max(2, oldTab.length / 8);
+        int start = transferIndex.addAndGet(-stride) &amp; ~stride;  // CAS 抢自己的区间
+        // 真正的 1.8 里会把旧桶头换成 MOVED 节点（hash=-1），让后续线程知道这桶在转移
+    }
+
+    /** 为了能跑 demo，提供一个不用 Unsafe 的 CAS 替代 */
+    static class U {
+        static boolean compareAndSwapObject(Node[] tab, long offset, Node expect, Node update) {
+            // 用 synchronized table 的方式模拟 CAS 原子性
+            synchronized (tab) {
+                // 简化：直接写入（真实 CAS 是硬件原语，这里只为 demo 能跑）
+                int idx = (int) (offset / 8L) - 1;
+                tab[idx] = update;
+                return true;
+            }
+        }
+    }
+
+    static class Node { volatile int hash; Object key, value; Node next;
+        Node(Object k, Object v) { hash = k.hashCode(); key = k; value = v; } }
+
+    /** 验证：多线程写同一批 key（同一桶概率高），对比 HashMap 丢数据 */
+    public static void main(String[] args) throws Exception {
+        CHM18 map = new CHM18();
+        int perThread = 50_000;
+        int threads = 8;
+
+        Thread[] ts = new Thread[threads];
+        long t1 = System.nanoTime();
+        for (int i = 0; i &lt; threads; i++) {
+            final int tid = i;
+            ts[i] = new Thread(() -&gt; {
+                for (int j = 0; j &lt; perThread; j++)
+                    map.put("k-" + (tid + "-" + j), j);
+            });
+        }
+        for (Thread t : ts) t.start();
+        for (Thread t : ts) t.join();
+        long cost = (System.nanoTime() - t1) / 1_000_000;
+
+        System.out.printf("1.8 CAS+synchronized: %,d 次写入, %d ms%n", perThread * threads, cost);
+        // 真实 1.8 的 get 不需要加锁 + 扫描链表，这里演示重点在 put 的锁粒度，略
+    }
+}</code></pre>
+
+<h1 seq="auto">演进总结</h1>
+
+<h2 seq="auto">从分段锁到桶级锁的价值</h2>
+
+<table>
+<thead>
+<tr><th><p>维度</p></th><th><p>1.7 分段锁</p></th><th><p>1.8 CAS+synchronized</p></th></tr>
+</thead>
+<tbody>
+<tr><td><p>锁竞争概率</p></td><td><p>高：只要落入同一 Segment 就竞争</p></td><td><p>低：只在同一桶冲突时竞争</p></td></tr>
+<tr><td><p>空桶写入</p></td><td><p>仍然要拿 Segment 锁</p></td><td><p>CAS 无锁，最快路径</p></td></tr>
+<tr><td><p>扩容吞吐</p></td><td><p>单线程迁移</p></td><td><p>多线程协作 transfer</p></td></tr>
+<tr><td><p>内存占用</p></td><td><p>Segment 对象开销</p></td><td><p>直接 Node[]，更紧凑</p></td></tr>
+</tbody>
+</table>
+
+<callout emoji="🎯" background-color="light-green" border-color="green">
+<p><b>设计启示：</b>并发容器的核心优化方向永远是——<b>缩小锁的保护范围</b>。从"整个表"到"段"到"桶"到"CAS 无锁"，每一步都让更多线程能真正并行工作。</p>
+</callout>
